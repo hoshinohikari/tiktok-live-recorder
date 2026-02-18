@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument(
         "-automatic_interval",
         dest="automatic_interval",
-        help="Sets the interval in minutes to check if the user is live in automatic mode. [Default: 5]",
+        help="Sets the interval in seconds to check if the user is live in automatic mode. [Default: 5]",
         type=int,
         default=5,
         action="store",
@@ -89,6 +89,16 @@ def parse_args():
         action="store_true",
         help="Activate the option to upload the video to Telegram at the end "
         "of the recording.\nRequires configuring the telegram.json file",
+    )
+
+    parser.add_argument(
+        "-use-ffmpeg",
+        dest="use_ffmpeg",
+        action="store_true",
+        help=(
+            "Use ffmpeg to record the live stream instead of the built-in "
+            "HTTP streaming method."
+        ),
     )
 
     parser.add_argument(
@@ -157,7 +167,7 @@ def validate_and_parse_args():
 
     if args.automatic_interval < 1:
         raise ArgsParseError(
-            "Incorrect automatic_interval value. Must be one minute or more."
+            "Incorrect automatic_interval value. Must be one second or more."
         )
 
     if args.mode == "manual":
