@@ -31,6 +31,7 @@ def _build_config(args, mode, cookies, user=None):
         use_telegram=args.telegram,
         bitrate=args.bitrate,
         ffmpeg_path=args.ffmpeg_path,
+        use_ffmpeg=args.use_ffmpeg,
     )
 
 

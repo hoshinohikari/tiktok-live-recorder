@@ -1,46 +1,71 @@
+import os
 import time
+import subprocess
 from http.client import HTTPException
-from pathlib import Path
 from threading import Thread
 
 from requests import RequestException
 
 from core.tiktok_api import TikTokAPI
 from utils.logger_manager import logger
-from utils.recorder_config import RecorderConfig
 from utils.video_management import VideoManagement
+from upload.telegram import Telegram
 from utils.custom_exceptions import LiveNotFound, UserLiveError, TikTokRecorderError
 from utils.enums import Mode, Error, TimeOut, TikTokError
 
 
 class TikTokRecorder:
-    def __init__(self, config: RecorderConfig):
-        self.tiktok = TikTokAPI(proxy=config.proxy, cookies=config.cookies)
+    def __init__(
+        self,
+        url,
+        user,
+        room_id,
+        mode,
+        automatic_interval,
+        cookies,
+        proxy,
+        output,
+        duration,
+        use_telegram,
+        use_ffmpeg,
+    ):
+        # Setup TikTok API client
+        self.tiktok = TikTokAPI(proxy=proxy, cookies=cookies)
 
-        self.url = config.url
-        self.user = config.user
-        self.room_id = config.room_id
-        self.mode = config.mode
-        self.automatic_interval = config.automatic_interval
-        self.duration = config.duration
-        self.output = config.output
-        self.bitrate = config.bitrate
-        self.ffmpeg_path = config.ffmpeg_path
-        self.use_telegram = config.use_telegram
-        self._proxy = config.proxy
-        self._cookies = config.cookies
+        # TikTok Data
+        self.url = url
+        self.user = user
+        self.room_id = room_id
 
-    def _setup(self):
-        """Resolve user/room data and validate prerequisites via network calls."""
+        # Tool Settings
+        self.mode = mode
+        self.automatic_interval = automatic_interval
+        self.duration = duration
+        self.output = output
+
+        # Upload Settings
+        self.use_telegram = use_telegram
+
+        # Recording method
+        self.use_ffmpeg = use_ffmpeg
+
+        # FFmpeg settings
+        self.ffmpeg_retries = 3
+        self.ffmpeg_retry_delay = 5
+        self.ffmpeg_rw_timeout = 30  # seconds without new data
+
+        # Check if the user's country is blacklisted
+        self.check_country_blacklisted()
+
+        # Retrieve sec_uid if the mode is FOLLOWERS
         if self.mode == Mode.FOLLOWERS:
-            self.check_country_blacklisted()
-
             self.sec_uid = self.tiktok.get_sec_uid()
             if self.sec_uid is None:
                 raise TikTokRecorderError("Failed to retrieve sec_uid.")
 
             logger.info("Followers mode activated\n")
         else:
+            # Get live information based on the provided user data
             if self.url:
                 self.user, self.room_id = self.tiktok.get_room_and_user_from_url(
                     self.url
@@ -52,8 +77,6 @@ class TikTokRecorder:
             if not self.room_id:
                 self.room_id = self.tiktok.get_room_id_from_user(self.user)
 
-            self.check_country_blacklisted()
-
             logger.info(f"USERNAME: {self.user}" + ("\n" if not self.room_id else ""))
             if self.room_id:
                 logger.info(
@@ -61,14 +84,13 @@ class TikTokRecorder:
                     + ("\n" if not self.tiktok.is_room_alive(self.room_id) else "")
                 )
 
-        # If proxy was used for the initial checks, switch to a direct connection
-        # for the actual stream download to avoid proxy bottlenecks
-        if self._proxy:
-            self.tiktok = TikTokAPI(proxy=None, cookies=self._cookies)
+        # If proxy is provided, set up the HTTP client without the proxy
+        if proxy:
+            self.tiktok = TikTokAPI(proxy=None, cookies=cookies)
 
     def run(self):
         """
-        Resolves prerequisites and runs the recorder in the selected mode.
+        runs the program in the selected mode.
 
         If the mode is MANUAL, it checks if the user is currently live and
         if so, starts recording.
@@ -81,8 +103,6 @@ class TikTokRecorder:
         the authenticated user. If any follower is live, it starts recording
         their live stream in a separate process.
         """
-        self._setup()
-
         if self.mode == Mode.MANUAL:
             self.manual_mode()
 
@@ -104,19 +124,29 @@ class TikTokRecorder:
                 self.room_id = self.tiktok.get_room_id_from_user(self.user)
                 self.manual_mode()
 
-            except (UserLiveError, LiveNotFound) as ex:
+            except UserLiveError as ex:
                 logger.info(ex)
                 logger.info(
-                    f"Waiting {self.automatic_interval} minutes before recheck\n"
+                    f"Waiting {self.automatic_interval} seconds before recheck\n"
                 )
-                time.sleep(self.automatic_interval * TimeOut.ONE_MINUTE)
+                time.sleep(self.automatic_interval)
 
-            except (ConnectionError, RequestException, HTTPException):
+            except LiveNotFound as ex:
+                logger.error(f"Live not found: {ex}")
+                logger.info(
+                    f"Waiting {self.automatic_interval} seconds before recheck\n"
+                )
+                time.sleep(self.automatic_interval)
+
+            except ConnectionError:
                 logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
                 time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
 
+            except Exception as ex:
+                logger.error(f"Unexpected error: {ex}\n")
+
     def followers_mode(self):
-        active_recordings = {}  # follower -> Thread
+        active_recordings = {}  # follower -> Process
 
         while True:
             try:
@@ -134,6 +164,7 @@ class TikTokRecorder:
                         room_id = self.tiktok.get_room_id_from_user(follower)
 
                         if not room_id or not self.tiktok.is_room_alive(room_id):
+                            # logger.info(f"@{follower} is not live. Skipping...")
                             continue
 
                         logger.info(f"@{follower} is live. Starting recording...")
@@ -148,133 +179,185 @@ class TikTokRecorder:
 
                         time.sleep(2.5)
 
-                    except TikTokRecorderError as e:
+                    except Exception as e:
                         logger.error(f"Error while processing @{follower}: {e}")
                         continue
 
-                    except Exception as e:
-                        logger.error(
-                            f"Unexpected error processing @{follower}: {e}",
-                            exc_info=True,
-                        )
-                        continue
-
                 print()
-                logger.info(
-                    f"Waiting {self.automatic_interval} minutes for the next check..."
-                )
-                time.sleep(self.automatic_interval * TimeOut.ONE_MINUTE)
+                delay = self.automatic_interval
+                logger.info(f"Waiting {delay} seconds for the next check...")
+                time.sleep(delay)
 
-            except (UserLiveError, LiveNotFound) as ex:
+            except UserLiveError as ex:
                 logger.info(ex)
                 logger.info(
-                    f"Waiting {self.automatic_interval} minutes before recheck\n"
+                    f"Waiting {self.automatic_interval} seconds before recheck\n"
                 )
-                time.sleep(self.automatic_interval * TimeOut.ONE_MINUTE)
+                time.sleep(self.automatic_interval)
 
-            except (ConnectionError, RequestException, HTTPException):
+            except ConnectionError:
                 logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
                 time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
 
-    def _build_output_path(self, user: str) -> str:
-        filename = (
-            f"TK_{user}_{time.strftime('%Y.%m.%d_%H-%M-%S', time.localtime())}_flv.mp4"
-        )
-        if self.output:
-            return str(Path(self.output) / filename)
-        return filename
+            except Exception as ex:
+                logger.error(f"Unexpected error: {ex}\n")
 
     def start_recording(self, user, room_id):
         """
         Start recording live
         """
-        live_urls = self.tiktok.get_live_url_candidates(room_id, user=user)
-        if not live_urls:
+        live_url = self.tiktok.get_live_url(room_id)
+        if not live_url:
             raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
-        output = self._build_output_path(user)
+        current_date = time.strftime("%Y.%m.%d_%H-%M-%S", time.localtime())
 
-        min_stream_bytes = 4096
-        for index, live_url in enumerate(live_urls, start=1):
-            if self.duration:
-                logger.info(
-                    f"Started recording for {self.duration} seconds "
-                    f"(stream {index}/{len(live_urls)})"
-                )
+        if isinstance(self.output, str) and self.output != "":
+            if not (self.output.endswith("/") or self.output.endswith("\\")):
+                if os.name == "nt":
+                    self.output = self.output + "\\"
+                else:
+                    self.output = self.output + "/"
+
+        output = f"{self.output if self.output else ''}TK_{user}_{current_date}.flv"
+
+        if self.duration:
+            logger.info(f"Started recording for {self.duration} seconds ")
+        else:
+            logger.info("Started recording...")
+
+        logger.info("[PRESS CTRL + C ONCE TO STOP]")
+        try:
+            if self.use_ffmpeg:
+                self._record_with_ffmpeg(live_url, output, room_id)
             else:
-                logger.info(f"Started recording (stream {index}/{len(live_urls)})...")
+                self._record_with_http_stream(live_url, output, room_id)
+        except KeyboardInterrupt:
+            logger.info("Recording stopped by user.")
 
-            buffer_size = 512 * 1024  # 512 KB buffer
-            buffer = bytearray()
-            bytes_written = 0
+        logger.info(f"Recording finished: {output}\n")
 
-            logger.info("[PRESS CTRL + C ONCE TO STOP]")
-            with open(output, "wb") as out_file:
-                stop_recording = False
-                stream_ended = False
-                while not stop_recording:
-                    try:
-                        if not self.tiktok.is_room_alive(room_id):
-                            logger.info("User is no longer live. Stopping recording.")
-                            break
+        if self.use_telegram:
+            Telegram().upload(output)
 
-                        start_time = time.time()
-                        for chunk in self.tiktok.download_live_stream(live_url):
-                            buffer.extend(chunk)
-                            bytes_written += len(chunk)
-                            if len(buffer) >= buffer_size:
-                                out_file.write(buffer)
-                                buffer.clear()
+    def _record_with_ffmpeg(self, live_url: str, output: str, room_id: str) -> None:
+        """
+        Record live stream using ffmpeg with retry and timeout handling.
+        """
+        rw_timeout_us = int(self.ffmpeg_rw_timeout * 1_000_000)
+        base_command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+            "-rw_timeout",
+            str(rw_timeout_us),
+            "-i",
+            live_url,
+            "-c",
+            "copy",
+        ]
 
-                            elapsed_time = time.time() - start_time
-                            if self.duration and elapsed_time >= self.duration:
-                                stop_recording = True
-                                break
-                        else:
-                            stream_ended = True
+        if self.duration:
+            base_command += ["-t", str(self.duration)]
 
-                        if stream_ended and bytes_written < min_stream_bytes:
-                            break
+        base_command.append(output)
 
-                    except ConnectionError:
-                        if self.mode == Mode.AUTOMATIC:
-                            logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
-                            time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
+        for attempt in range(1, self.ffmpeg_retries + 1):
+            if not self.tiktok.is_room_alive(room_id):
+                logger.info("User is no longer live. Stopping recording.")
+                return
 
-                    except (RequestException, HTTPException) as ex:
-                        logger.warning(f"Network hiccup, retrying: {ex}")
-                        time.sleep(2)
+            logger.info(f"FFmpeg recording attempt {attempt}/{self.ffmpeg_retries}...")
 
-                    except KeyboardInterrupt:
-                        logger.info("Recording stopped by user.")
-                        stop_recording = True
+            try:
+                timeout = self.duration + 30 if self.duration else None
+                result = subprocess.run(
+                    base_command,
+                    check=False,
+                    timeout=timeout,
+                )
 
-                    except Exception as ex:
-                        logger.error(
-                            f"Unexpected error during recording: {ex}",
-                            exc_info=True,
-                        )
-                        stop_recording = True
+                if result.returncode == 0:
+                    return
 
-                    finally:
-                        if buffer:
+                logger.error(
+                    f"FFmpeg exited with code {result.returncode}. Retrying..."
+                )
+            except subprocess.TimeoutExpired:
+                logger.error("FFmpeg recording timed out. Retrying...")
+            except FileNotFoundError:
+                raise TikTokRecorderError(
+                    "FFmpeg not found. Please ensure ffmpeg is installed and in PATH."
+                )
+            except Exception as ex:
+                logger.error(f"Unexpected ffmpeg error: {ex}. Retrying...")
+
+            if attempt < self.ffmpeg_retries:
+                time.sleep(self.ffmpeg_retry_delay)
+
+        raise TikTokRecorderError("FFmpeg failed after multiple attempts.")
+
+    def _record_with_http_stream(
+        self, live_url: str, output: str, room_id: str
+    ) -> None:
+        """
+        Record live stream using the HTTP streaming method.
+        """
+        buffer_size = 512 * 1024  # 512 KB buffer
+        buffer = bytearray()
+
+        logger.info("[PRESS CTRL + C ONCE TO STOP]")
+        with open(output, "wb") as out_file:
+            stop_recording = False
+            while not stop_recording:
+                try:
+                    if not self.tiktok.is_room_alive(room_id):
+                        logger.info("User is no longer live. Stopping recording.")
+                        break
+
+                    start_time = time.time()
+                    for chunk in self.tiktok.download_live_stream(live_url):
+                        buffer.extend(chunk)
+                        if len(buffer) >= buffer_size:
                             out_file.write(buffer)
                             buffer.clear()
-                        out_file.flush()
 
-            if bytes_written >= min_stream_bytes:
-                break
+                        elapsed_time = time.time() - start_time
+                        if self.duration and elapsed_time >= self.duration:
+                            stop_recording = True
+                            break
 
-            logger.warning(
-                f"Stream {index}/{len(live_urls)} returned only {bytes_written} bytes. "
-                "Trying another CDN/quality..."
-            )
-        else:
-            Path(output).unlink(missing_ok=True)
-            raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
+                except ConnectionError:
+                    if self.mode == Mode.AUTOMATIC:
+                        logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
+                        time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
 
-        logger.info(f"Recording finished: {Path(output).resolve()}\n")
-        VideoManagement.convert_flv_to_mp4(output, self.bitrate, self.ffmpeg_path)
+                except (RequestException, HTTPException):
+                    time.sleep(2)
+
+                except KeyboardInterrupt:
+                    logger.info("Recording stopped by user.")
+                    stop_recording = True
+
+                except Exception as ex:
+                    logger.error(f"Unexpected error: {ex}\n")
+                    stop_recording = True
+
+                finally:
+                    if buffer:
+                        out_file.write(buffer)
+                        buffer.clear()
+                    out_file.flush()
+
+        logger.info(f"Recording finished: {output}\n")
 
     def check_country_blacklisted(self):
         is_blacklisted = self.tiktok.is_country_blacklisted()
