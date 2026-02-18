@@ -92,6 +92,67 @@ Below is a complete list of available flags and how to use them.
 python main.py [options]
 ```
 
+### Run as a systemd service (Linux)
+
+Use the installer module in `src/systemd_installer.py` to create and enable a service.
+By default, service output is saved to:
+
+```bash
+<working-directory>/logs/<service-name>-YYYY-MM-DD.log
+```
+
+User service (no sudo, runs under current user):
+
+```bash
+cd src
+python3 systemd_installer.py \
+  --user-service \
+  --enable-now \
+  --service-name tiktok-auto \
+  -- -user someuser -mode automatic -automatic_interval 30
+```
+
+System service (requires sudo):
+
+```bash
+cd src
+sudo python3 systemd_installer.py \
+  --enable-now \
+  --run-as-user "$USER" \
+  --service-name tiktok-auto \
+  -- -user someuser -mode automatic -automatic_interval 30
+```
+
+Custom log file path:
+
+```bash
+cd src
+python3 systemd_installer.py \
+  --user-service \
+  --enable-now \
+  --service-name tiktok-auto \
+  --log-file ./logs/tiktok-auto-custom.log \
+  -- -user someuser -mode automatic -automatic_interval 30
+```
+
+Note: `--log-file ./logs/tiktok-auto-custom.log` generates daily files like:
+`./logs/tiktok-auto-custom-2026-02-18.log`
+
+Useful commands:
+
+```bash
+# user service
+systemctl --user status tiktok-auto.service
+systemctl --user restart tiktok-auto.service
+
+# system service
+sudo systemctl status tiktok-auto.service
+sudo systemctl restart tiktok-auto.service
+
+# view local log file
+tail -f ./logs/tiktok-auto-$(date +%F).log
+```
+
 ### `-user <USERNAME>`
  
 
