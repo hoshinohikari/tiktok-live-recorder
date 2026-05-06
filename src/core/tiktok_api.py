@@ -381,6 +381,7 @@ class TikTokAPI:
         if not qualities:
             logger.warning("No qualities found in the stream data. Returning None.")
             return candidates
+
         level_map = {q["sdk_key"]: q["level"] for q in qualities}
 
         ordered_sdk_keys = sorted(
@@ -412,6 +413,74 @@ class TikTokAPI:
     def get_live_url_candidates(self, room_id: str, user: str = None) -> list[str]:
         """Return candidate CDN URLs for the streaming."""
         return self.get_live_urls(room_id, user=user)
+
+    def _probe_original_quality_url(self, sdk_data: dict) -> str | None:
+        """
+        Derive and validate the hidden 'original quality' stream URL.
+
+        The audio-only (ao) entry in sdk_data has a FLV URL of the form:
+            https://<cdn>/stage/stream-<id>.flv?expire=...&sign=...&only_audio=1
+
+        The same URL **without** the ``only_audio=1`` parameter is the original
+        (highest-quality) video+audio stream that TikTok does not expose through
+        the standard quality selector.
+
+        Validation strategy: open the URL with a short timeout and attempt to
+        read the first 2 KB of data.  If the server streams bytes back, the URL
+        is live and we return it; otherwise we return None so the caller can
+        fall back to the normal quality-selection logic.
+
+        Args:
+            sdk_data: the parsed ``data`` dict from ``stream_data``.
+
+        Returns:
+            The original-quality FLV URL string, or ``None`` if unavailable.
+        """
+        ao_flv: str = sdk_data.get("ao", {}).get("main", {}).get("flv", "")
+        if not ao_flv or "only_audio=1" not in ao_flv:
+            return None
+
+        # Strip the audio-only marker to reveal the original stream URL.
+        original_url = (
+            ao_flv
+            .replace("&only_audio=1", "")
+            .replace("?only_audio=1&", "?")
+            .replace("?only_audio=1", "")
+        )
+
+        logger.debug(f"Probing original quality URL: {original_url}")
+
+        try:
+            response = self._http_client_stream.get(
+                original_url, stream=True, timeout=5
+            )
+            if response.status_code != 200:
+                logger.debug(
+                    f"Original quality probe returned HTTP {response.status_code}, "
+                    "falling back to standard quality selection."
+                )
+                response.close()
+                return None
+
+            first_chunk = next(response.iter_content(chunk_size=2048), None)
+            response.close()
+
+            if first_chunk:
+                logger.info("Original quality stream is available, using it.")
+                return original_url
+
+            logger.debug(
+                "Original quality probe returned no data, "
+                "falling back to standard quality selection."
+            )
+            return None
+
+        except Exception as e:
+            logger.debug(
+                f"Original quality probe failed ({e}), "
+                "falling back to standard quality selection."
+            )
+            return None
 
     def download_live_stream(self, live_url: str):
         """Generator that returns the live stream for a given room_id."""
