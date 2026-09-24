@@ -124,6 +124,19 @@ uv run python src/main.py [options]
 | `-telegram` | Upload the recording to Telegram when done. Requires `telegram.json`. |
 | `-no-update-check` | Skip the automatic update check on startup. |
 
+### HTTP backend
+
+API requests use `curl_cffi` by default, except on Termux where they use
+`requests`. Set `TIKTOK_HTTP_BACKEND` to `curl_cffi`, `requests`, or `auto`
+(the default) to choose explicitly:
+
+```bash
+TIKTOK_HTTP_BACKEND=curl_cffi uv run python src/main.py -mode automatic -user USERNAME
+```
+
+The built-in live stream downloader continues to use `requests`; `-use-ffmpeg`
+selects FFmpeg for stream recording.
+
 ### Recording Modes
 
 - **`manual`** *(default)*: Records immediately if the user is currently live.

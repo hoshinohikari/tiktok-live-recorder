@@ -1,3 +1,5 @@
+import os
+
 import requests
 
 from utils.enums import StatusCode
@@ -32,9 +34,15 @@ class HttpClient:
         self.configure_session()
 
     def configure_session(self) -> None:
+        backend = os.environ.get("TIKTOK_HTTP_BACKEND", "auto").strip().lower()
+        if backend not in {"auto", "requests", "curl_cffi"}:
+            raise ValueError(
+                "TIKTOK_HTTP_BACKEND must be auto, requests, or curl_cffi"
+            )
+
         self.req_stream = requests.Session()
 
-        if is_termux():
+        if backend == "requests" or (backend == "auto" and is_termux()):
             self.req = self.req_stream
         else:
             from curl_cffi import Session, CurlSslVersion, CurlOpt

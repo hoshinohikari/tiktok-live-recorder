@@ -38,10 +38,15 @@ def is_termux() -> bool:
     Returns:
         bool: True if running in Termux, False otherwise.
     """
-    import distro
+    import os
     import platform
 
-    return platform.system().lower() == "linux" and distro.like() == ""
+    if platform.system().lower() != "linux":
+        return False
+
+    return bool(os.environ.get("TERMUX_VERSION")) or os.environ.get(
+        "PREFIX", ""
+    ).startswith(("/data/data/com.termux/files/usr", "/data/user/0/com.termux/files/usr"))
 
 
 def is_windows() -> bool:
