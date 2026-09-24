@@ -6,6 +6,11 @@ from threading import Thread
 
 from requests import RequestException
 
+try:
+    from curl_cffi.requests.exceptions import RequestException as CurlRequestException
+except ImportError:  # Termux can use requests without curl_cffi.
+    CurlRequestException = RequestException
+
 from core.tiktok_api import TikTokAPI
 from utils.logger_manager import logger
 from utils.recorder_config import RecorderConfig
@@ -115,8 +120,11 @@ class TikTokRecorder:
                 )
                 time.sleep(self.automatic_interval)
 
-            except ConnectionError:
-                logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
+            except (RequestException, CurlRequestException, ConnectionError) as ex:
+                logger.error(
+                    f"Request failed: {ex}. Retrying in "
+                    f"{TimeOut.CONNECTION_CLOSED} minutes"
+                )
                 time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
 
             except Exception as ex:

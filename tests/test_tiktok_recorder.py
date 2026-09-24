@@ -2,12 +2,15 @@ import sys
 from pathlib import Path
 
 import pytest
+from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from core.tiktok_recorder import TikTokRecorder  # noqa: E402
 from utils.custom_exceptions import TikTokRecorderError  # noqa: E402
-from utils.enums import Mode  # noqa: E402
+from utils.enums import Mode, TimeOut  # noqa: E402
 from utils.recorder_config import RecorderConfig  # noqa: E402
 
 
@@ -35,6 +38,44 @@ class FakeTikTokAPI:
     def is_room_alive(self, room_id):
         self.calls.append(f"is_room_alive:{room_id}")
         return True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RequestsConnectionError("connection reset"),
+        CurlConnectionError("connection reset"),
+        RequestsJSONDecodeError("invalid JSON", "", 0),
+    ],
+)
+def test_automatic_mode_backs_off_after_request_failure(monkeypatch, error):
+    class StopLoop(BaseException):
+        pass
+
+    class FailingAPI:
+        calls = 0
+
+        def get_room_id_from_user(self, user):
+            self.calls += 1
+            if self.calls > 1:
+                raise StopLoop
+            raise error
+
+    sleeps = []
+
+    def stop_after_sleep(seconds):
+        sleeps.append(seconds)
+        raise StopLoop
+
+    recorder = object.__new__(TikTokRecorder)
+    recorder.user = "creator"
+    recorder.tiktok = FailingAPI()
+    monkeypatch.setattr("core.tiktok_recorder.time.sleep", stop_after_sleep)
+
+    with pytest.raises(StopLoop):
+        recorder.automatic_mode()
+
+    assert sleeps == [TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE]
 
 
 def test_setup_resolves_room_id_before_country_check_for_manual_user():

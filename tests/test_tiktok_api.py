@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -6,24 +7,34 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from core.tiktok_api import TikTokAPI  # noqa: E402
-from utils.custom_exceptions import UserLiveError  # noqa: E402
+from utils.custom_exceptions import TikRecUnavailableError, UserLiveError  # noqa: E402
 
 
 class FakeResponse:
     def __init__(self, data):
         self._data = data
+        self.status_code = 200
 
     def json(self):
         return self._data
+
+    @property
+    def text(self):
+        return json.dumps(self._data)
+
+    def raise_for_status(self):
+        pass
 
 
 class FakeHttpClient:
     def __init__(self, responses):
         self.responses = responses
         self.urls = []
+        self.request_kwargs = []
 
-    def get(self, url):
+    def get(self, url, **kwargs):
         self.urls.append(url)
+        self.request_kwargs.append(kwargs)
         return FakeResponse(self.responses.pop(0))
 
 
@@ -58,6 +69,43 @@ def test_is_room_alive_accepts_confirmed_stream_room():
     )
 
     assert api.is_room_alive("123") is True
+
+
+def test_live_checks_use_a_timeout_for_both_requests():
+    api = build_api(
+        {"data": [{"alive": True}]},
+        {"data": {"status": 2, "stream_url": {"flv_pull_url": {"HD1": "url"}}}},
+    )
+
+    assert api.is_room_alive("123") is True
+    assert len(api.http_client.request_kwargs) == 2
+    assert all(kwargs.get("timeout") for kwargs in api.http_client.request_kwargs)
+
+
+def test_room_lookup_uses_a_timeout_for_signing_and_user_requests():
+    api = build_api(
+        {"signed_path": "/@creator/live"},
+        {"data": {"user": {"roomId": "123"}}},
+    )
+    api.BASE_URL = "https://www.tiktok.com"
+    api.TIKREC_API = "https://tikrec.com"
+
+    assert api.get_room_id_from_user("creator") == "123"
+    assert len(api.http_client.request_kwargs) == 2
+    assert all(kwargs.get("timeout") for kwargs in api.http_client.request_kwargs)
+
+
+def test_room_lookup_fallback_uses_a_timeout(monkeypatch):
+    api = build_api({"data": {"room_info": {"id": "123"}}})
+    api.EULER_API = "https://tiktok.eulerstream.com"
+
+    def unavailable(_user):
+        raise TikRecUnavailableError("signing service unavailable")
+
+    monkeypatch.setattr(api, "_tikrec_get_room_id_signed_url", unavailable)
+
+    assert api.get_room_id_from_user("creator") == "123"
+    assert api.http_client.request_kwargs[0].get("timeout")
 
 
 def test_is_room_alive_keeps_restricted_live_as_alive():

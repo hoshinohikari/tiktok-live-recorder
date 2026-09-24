@@ -14,6 +14,8 @@ from utils.custom_exceptions import (
 
 
 class TikTokAPI:
+    REQUEST_TIMEOUT = (5, 20)  # connect and read timeouts in seconds
+
     def __init__(self, proxy, cookies):
         self.BASE_URL = "https://www.tiktok.com"
         self.WEBCAST_URL = "https://webcast.tiktok.com"
@@ -48,7 +50,8 @@ class TikTokAPI:
 
         alive_data = self.http_client.get(
             f"{self.WEBCAST_URL}/webcast/room/check_alive/"
-            f"?aid=1988&region=CH&room_ids={room_id}&user_is_login=true"
+            f"?aid=1988&region=CH&room_ids={room_id}&user_is_login=true",
+            timeout=self.REQUEST_TIMEOUT,
         ).json()
 
         data_list = alive_data.get("data")
@@ -61,7 +64,8 @@ class TikTokAPI:
             return False
 
         room_info = self.http_client.get(
-            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
+            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}",
+            timeout=self.REQUEST_TIMEOUT,
         ).json()
 
         status_code = room_info.get("status_code", 0)
@@ -156,6 +160,7 @@ class TikTokAPI:
             f"{self.EULER_API}/webcast/room_info",
             params=params,
             headers={"x-api-key": ""},
+            timeout=self.REQUEST_TIMEOUT,
         )
 
         if response.status_code != 200:
@@ -174,6 +179,7 @@ class TikTokAPI:
             response = self.http_client.get(
                 f"{self.TIKREC_API}/tiktok/room/api/sign",
                 params={"unique_id": user},
+                timeout=self.REQUEST_TIMEOUT,
             )
             response.raise_for_status()
         except Exception as e:
@@ -209,7 +215,7 @@ class TikTokAPI:
             )
             return self._old_get_room_id_from_user(user)
 
-        response = self.http_client.get(signed_url)
+        response = self.http_client.get(signed_url, timeout=self.REQUEST_TIMEOUT)
         content = response.text
 
         if not content or "Please wait" in content:
