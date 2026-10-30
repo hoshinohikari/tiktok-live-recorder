@@ -27,6 +27,14 @@ class StatusCode(IntEnum):
     MOVED = 301
 
 
+class RoomStatus(Enum):
+    """Best-known live state from a room status query."""
+
+    LIVE = "live"
+    OFFLINE = "offline"
+    UNKNOWN = "unknown"
+
+
 class Mode(IntEnum):
     """
     Enumeration that represents the recording modes.
@@ -118,7 +126,7 @@ class Info(Enum):
     def __iter__(self):
         return iter(self.value)
 
-    NEW_FEATURES = [
+    NEW_FEATURES = [  # noqa: RUF012 - public enum payload is intentionally a list
         "Rejected ended TikTok rooms that still expose stale stream URLs.",
         "Tried alternate stream URLs and skipped empty CDN responses.",
         "Resolved room IDs before country checks for manual username recordings.",

@@ -1,20 +1,30 @@
 import html
 import json
 import re
+import time
+from dataclasses import dataclass
 
 from http_utils.http_client import HttpClient
-from utils.enums import StatusCode, TikTokError
-from utils.logger_manager import logger
 from utils.custom_exceptions import (
-    UserLiveError,
-    TikTokRecorderError,
     LiveNotFound,
     TikRecUnavailableError,
+    TikTokRecorderError,
+    UserLiveError,
 )
+from utils.enums import RoomStatus, StatusCode, TikTokError
+from utils.logger_manager import logger
+from utils.url_sanitizer import redact_url, redact_urls_in_text
+
+
+@dataclass(frozen=True)
+class LiveStreamCandidate:
+    url: str
+    is_original_quality: bool = False
 
 
 class TikTokAPI:
     REQUEST_TIMEOUT = (5, 20)  # connect and read timeouts in seconds
+    MAX_SELECTION_HTTP_TIMEOUT_SECONDS = 5.0
 
     def __init__(self, proxy, cookies):
         self.BASE_URL = "https://www.tiktok.com"
@@ -45,6 +55,20 @@ class TikTokAPI:
         """
         Checking whether the user is live.
         """
+        return self._query_room_status(room_id) is RoomStatus.LIVE
+
+    def get_room_status(self, room_id: str) -> RoomStatus:
+        """Return live, confirmed offline, or unknown when status is unavailable."""
+        try:
+            return self._query_room_status(room_id)
+        except Exception as ex:  # noqa: BLE001 - failed queries mean unknown status
+            logger.warning(
+                "Live status check failed; status is unknown: %s",
+                redact_urls_in_text(str(ex)),
+            )
+            return RoomStatus.UNKNOWN
+
+    def _query_room_status(self, room_id: str) -> RoomStatus:
         if not room_id:
             raise UserLiveError(TikTokError.USER_NOT_CURRENTLY_LIVE)
 
@@ -59,9 +83,14 @@ class TikTokAPI:
             not isinstance(data_list, list)
             or not data_list
             or not isinstance(data_list[0], dict)
-            or not data_list[0].get("alive", False)
         ):
-            return False
+            return RoomStatus.UNKNOWN
+
+        alive_value = data_list[0].get("alive")
+        if alive_value is False:
+            return RoomStatus.OFFLINE
+        if alive_value is not True:
+            return RoomStatus.UNKNOWN
 
         room_info = self.http_client.get(
             f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}",
@@ -70,30 +99,49 @@ class TikTokAPI:
 
         status_code = room_info.get("status_code", 0)
         if status_code == 4003110:
-            return True
+            return RoomStatus.LIVE
 
         if status_code != 0:
-            return False
+            return RoomStatus.UNKNOWN
 
-        room_data = room_info.get("data") or {}
+        room_data = room_info.get("data")
+        if not isinstance(room_data, dict):
+            return RoomStatus.UNKNOWN
+
         room_status = room_data.get("status")
         if room_status is not None and str(room_status) != "2":
-            return False
+            return RoomStatus.OFFLINE
 
         stream_url = room_data.get("stream_url") or {}
+        if not isinstance(stream_url, dict):
+            return RoomStatus.UNKNOWN
+
+        sdk_data = stream_url.get("live_core_sdk_data") or {}
+        if not isinstance(sdk_data, dict):
+            return RoomStatus.UNKNOWN
+        pull_data = sdk_data.get("pull_data") or {}
+        if not isinstance(pull_data, dict):
+            return RoomStatus.UNKNOWN
         sdk_stream_data = (
-            (stream_url.get("live_core_sdk_data") or {})
-            .get("pull_data", {})
-            .get("stream_data")
+            pull_data.get("stream_data")
         )
 
-        return bool(
+        def has_stream_url(value):
+            if isinstance(value, str):
+                return bool(value.strip())
+            if isinstance(value, dict):
+                return any(has_stream_url(item) for item in value.values())
+            return False
+
+        if (
             sdk_stream_data
-            or stream_url.get("flv_pull_url")
-            or stream_url.get("hls_pull_url")
-            or stream_url.get("hls_pull_url_map")
-            or stream_url.get("rtmp_pull_url")
-        )
+            or has_stream_url(stream_url.get("flv_pull_url"))
+            or has_stream_url(stream_url.get("hls_pull_url"))
+            or has_stream_url(stream_url.get("hls_pull_url_map"))
+            or has_stream_url(stream_url.get("rtmp_pull_url"))
+        ):
+            return RoomStatus.LIVE
+        return RoomStatus.UNKNOWN
 
     def get_sec_uid(self):
         """
@@ -112,7 +160,8 @@ class TikTokAPI:
         Given a room_id, I get the username
         """
         data = self.http_client.get(
-            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
+            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}",
+            timeout=5,
         ).json()
 
         if "Follow the creator to watch their LIVE" in json.dumps(data):
@@ -182,7 +231,7 @@ class TikTokAPI:
                 timeout=self.REQUEST_TIMEOUT,
             )
             response.raise_for_status()
-        except Exception as e:
+        except Exception as e:  # Translate signing failures to a domain error.
             raise TikRecUnavailableError(
                 f"tikrec signing service is unreachable: {e}"
             ) from e
@@ -293,155 +342,10 @@ class TikTokAPI:
 
         return followers
 
-    def _get_stream_url_from_page(self, user: str) -> str | None:
-        """
-        Fallback: fetch the live page HTML and extract the stream URL directly.
-        Used when the webcast API returns status code 4003110 (WAF/access restriction).
-        """
-        try:
-            live_page_url = f"{self.BASE_URL}/@{user}/live"
-            response = self.http_client.get(live_page_url)
-            content = response.text
-
-            flv_matches = re.findall(r'https?://[^\s"\'<>]+\.flv[^\s"\'<>]*', content)
-            if flv_matches:
-                # Prefer original (_or4) or SD quality
-                for url in flv_matches:
-                    url = html.unescape(url.rstrip("\\"))
-                    if "_or4" in url or "_sd" in url:
-                        logger.info(f"Found stream URL from page: {url[:80]}...")
-                        return url
-                return html.unescape(flv_matches[0].rstrip("\\"))
-
-            hls_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', content)
-            if hls_matches:
-                return html.unescape(hls_matches[0].rstrip("\\"))
-
-            return None
-        except Exception as e:
-            logger.warning(f"Failed to extract stream URL from page: {e}")
-            return None
-
-    def _add_live_url_candidate(self, candidates: list[str], url: str | None) -> None:
-        if url and url not in candidates:
-            candidates.append(url)
-
-    def get_live_urls(self, room_id: str, user: str = None) -> list[str]:
-        """
-        Return candidate CDN URLs (flv or m3u8) for the streaming.
-        If the API returns status code 4003110 and a username is provided,
-        falls back to scraping the live page directly.
-        """
-        data = self.http_client.get(
-            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
-        ).json()
-
-        if "This account is private" in data:
-            raise UserLiveError(TikTokError.ACCOUNT_PRIVATE)
-
-        status_code = data.get("status_code", 0)
-
-        if status_code == 4003110:
-            if user:
-                logger.info(
-                    "API blocked by WAF (4003110). Trying fallback: extract stream URL from live page..."
-                )
-                fallback_url = self._get_stream_url_from_page(user)
-                if fallback_url:
-                    return [fallback_url]
-
-            raise UserLiveError(TikTokError.LIVE_RESTRICTION)
-
-        room_data = data.get("data") or {}
-        room_status = room_data.get("status")
-        if room_status is not None and str(room_status) != "2":
-            raise UserLiveError(TikTokError.USER_NOT_CURRENTLY_LIVE)
-
-        stream_url = room_data.get("stream_url", {})
-
-        sdk_data_str = (
-            stream_url.get("live_core_sdk_data", {})
-            .get("pull_data", {})
-            .get("stream_data")
-        )
-        candidates = []
-        if not sdk_data_str:
-            logger.warning(
-                "No SDK stream data found. Falling back to legacy URLs. Consider contacting the developer to update the code."
-            )
-            flv_pull_url = stream_url.get("flv_pull_url", {})
-            for key in ("FULL_HD1", "HD1", "SD2", "SD1"):
-                self._add_live_url_candidate(candidates, flv_pull_url.get(key))
-            self._add_live_url_candidate(candidates, stream_url.get("hls_pull_url"))
-            self._add_live_url_candidate(candidates, stream_url.get("rtmp_pull_url"))
-            return candidates
-
-        # Extract stream options
-        sdk_data = json.loads(sdk_data_str).get("data", {})
-        qualities = (
-            stream_url.get("live_core_sdk_data", {})
-            .get("pull_data", {})
-            .get("options", {})
-            .get("qualities", [])
-        )
-        if not qualities:
-            logger.warning("No qualities found in the stream data. Returning None.")
-            return candidates
-
-        level_map = {q["sdk_key"]: q["level"] for q in qualities}
-
-        ordered_sdk_keys = sorted(
-            sdk_data.keys(), key=lambda key: level_map.get(key, -1), reverse=True
-        )
-        for sdk_key in ordered_sdk_keys:
-            entry = sdk_data[sdk_key]
-            stream_main = entry.get("main", {})
-            self._add_live_url_candidate(candidates, stream_main.get("flv"))
-            self._add_live_url_candidate(
-                candidates, stream_main.get("hls") or stream_main.get("m3u8")
-            )
-
-        flv_pull_url = stream_url.get("flv_pull_url", {})
-        for key in ("FULL_HD1", "HD1", "SD2", "SD1"):
-            self._add_live_url_candidate(candidates, flv_pull_url.get(key))
-        self._add_live_url_candidate(candidates, stream_url.get("hls_pull_url"))
-        self._add_live_url_candidate(candidates, stream_url.get("rtmp_pull_url"))
-
-        return candidates
-
-    def get_live_url(self, room_id: str, user: str = None) -> str | None:
-        """Return the first candidate CDN URL for the streaming."""
-        live_urls = self.get_live_urls(room_id, user=user)
-        if live_urls:
-            return live_urls[0]
-        return None
-
-    def get_live_url_candidates(self, room_id: str, user: str = None) -> list[str]:
-        """Return candidate CDN URLs for the streaming."""
-        return self.get_live_urls(room_id, user=user)
-
-    def _probe_original_quality_url(self, sdk_data: dict) -> str | None:
-        """
-        Derive and validate the hidden 'original quality' stream URL.
-
-        The audio-only (ao) entry in sdk_data has a FLV URL of the form:
-            https://<cdn>/stage/stream-<id>.flv?expire=...&sign=...&only_audio=1
-
-        The same URL **without** the ``only_audio=1`` parameter is the original
-        (highest-quality) video+audio stream that TikTok does not expose through
-        the standard quality selector.
-
-        Validation strategy: open the URL with a short timeout and attempt to
-        read the first 2 KB of data.  If the server streams bytes back, the URL
-        is live and we return it; otherwise we return None so the caller can
-        fall back to the normal quality-selection logic.
-
-        Args:
-            sdk_data: the parsed ``data`` dict from ``stream_data``.
-
-        Returns:
-            The original-quality FLV URL string, or ``None`` if unavailable.
-        """
+    def _derive_original_quality_url(
+        self, sdk_data: dict, *, stale_urls: set[str] | None = None
+    ) -> str | None:
+        """Derive the original-quality URL; the recorder validates its media."""
         ao_flv: str = sdk_data.get("ao", {}).get("main", {}).get("flv", "")
         if not ao_flv or "only_audio=1" not in ao_flv:
             return None
@@ -454,49 +358,105 @@ class TikTokAPI:
             .replace("?only_audio=1", "")
         )
 
-        logger.debug(f"Probing original quality URL: {original_url}")
-
-        try:
-            response = self._http_client_stream.get(
-                original_url, stream=True, timeout=5
+        if stale_urls is not None and original_url in stale_urls:
+            logger.debug(
+                "Skipping previously failed original-quality URL: %s",
+                redact_url(original_url),
             )
-            if response.status_code != 200:
-                logger.debug(
-                    f"Original quality probe returned HTTP {response.status_code}, "
-                    "falling back to standard quality selection."
-                )
-                response.close()
+            return None
+
+        logger.debug("Derived original-quality candidate: %s", redact_url(original_url))
+        return original_url
+
+    def _get_selection_response(self, url: str, timeout: float):
+        """Open a selection response with the strongest backend timeout available."""
+        if type(self.http_client).__module__.startswith("curl_cffi."):
+            # curl_cffi's scalar timeout is a total CURLOPT_TIMEOUT_MS when the
+            # response is buffered. Streaming changes it to a low-speed timeout.
+            return self.http_client.get(url, timeout=timeout)
+
+        request_timeout = (
+            min(timeout, self.MAX_SELECTION_HTTP_TIMEOUT_SECONDS),
+            min(timeout, 1),
+        )
+        return self.http_client.get(url, stream=True, timeout=request_timeout)
+
+    @staticmethod
+    def _read_response_body(
+        response, *, deadline: float | None = None
+    ) -> bytes | None:
+        """Read a streamed response while checking the selection deadline.
+
+        Requests' read timeout is an idle timeout between bytes, not a total
+        transfer limit. Its bodies are consumed one byte at a time and checked
+        against the deadline; a one-second read timeout bounds a stalled read.
+        curl_cffi responses are already fully buffered by a request with a total
+        timeout. Requests can still spend longer than the budget parsing
+        slow-trickled response headers before returning the Response object.
+        """
+        body = bytearray()
+        chunk_size = 1 if deadline is not None else 64 * 1024
+        try:
+            if type(response).__module__.startswith("curl_cffi."):
+                body = response.content
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
+                return body
+
+            chunks = response.iter_content(chunk_size=chunk_size)
+
+            if deadline is not None and time.monotonic() >= deadline:
                 return None
 
-            first_chunk = next(response.iter_content(chunk_size=2048), None)
+            for chunk in chunks:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
+                if chunk:
+                    body.extend(chunk)
+
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            return bytes(body)
+        finally:
             response.close()
 
-            if first_chunk:
-                logger.info("Original quality stream is available, using it.")
-                return original_url
-
-            logger.debug(
-                "Original quality probe returned no data, "
-                "falling back to standard quality selection."
-            )
-            return None
-
-        except Exception as e:
-            logger.debug(
-                f"Original quality probe failed ({e}), "
-                "falling back to standard quality selection."
-            )
-            return None
-
-    def _get_stream_url_from_page(self, user: str) -> str | None:
+    def _get_stream_url_from_page(
+        self, user: str, *, deadline: float | None = None
+    ) -> str | None:
         """
         Fallback: fetch the live page HTML and extract the stream URL directly.
         Used when the webcast API returns status code 4003110 (WAF/access restriction).
         """
         try:
             live_page_url = f"{self.BASE_URL}/@{user}/live"
-            response = self.http_client.get(live_page_url)
-            content = response.text
+            timeout = self.MAX_SELECTION_HTTP_TIMEOUT_SECONDS
+            if deadline is not None:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    logger.warning(
+                        "Original selection budget exhausted before live-page fallback request."
+                    )
+                    return None
+                timeout = min(timeout, self.MAX_SELECTION_HTTP_TIMEOUT_SECONDS)
+            response = self._get_selection_response(live_page_url, timeout)
+            content_bytes = self._read_response_body(response, deadline=deadline)
+            if content_bytes is None:
+                logger.warning(
+                    "Original selection budget exhausted while reading the "
+                    "live-page fallback response."
+                )
+                return None
+
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(
+                    "Original selection budget exhausted before parsing the "
+                    "live-page fallback response."
+                )
+                return None
+
+            content = content_bytes.decode(
+                getattr(response, "encoding", None) or "utf-8", errors="replace"
+            )
 
             flv_matches = re.findall(r'https?://[^\s"\'<>]+\.flv[^\s"\'<>]*', content)
             if flv_matches:
@@ -504,7 +464,10 @@ class TikTokAPI:
                 for url in flv_matches:
                     url = html.unescape(url.rstrip("\\"))
                     if "_or4" in url or "_sd" in url:
-                        logger.info(f"Found stream URL from page: {url[:80]}...")
+                        logger.info(
+                            "Found stream URL from page: %s...",
+                            redact_url(url)[:80],
+                        )
                         return url
                 return html.unescape(flv_matches[0].rstrip("\\"))
 
@@ -513,23 +476,82 @@ class TikTokAPI:
                 return html.unescape(hls_matches[0].rstrip("\\"))
 
             return None
-        except Exception as e:
-            logger.warning(f"Failed to extract stream URL from page: {e}")
+        except Exception as e:  # noqa: BLE001 - page parsing/network failures are optional
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(
+                    "Original selection budget exhausted during live-page fallback request."
+                )
+            logger.warning(
+                "Failed to extract stream URL from page: %s",
+                redact_urls_in_text(str(e)),
+            )
             return None
 
     def _add_live_url_candidate(self, candidates: list[str], url: str | None) -> None:
         if url and url not in candidates:
             candidates.append(url)
 
-    def get_live_urls(self, room_id: str, user: str = None) -> list[str]:
+    def get_live_stream_candidates(
+        self,
+        room_id: str,
+        user: str | None = None,
+        *,
+        deadline: float | None = None,
+        stale_urls: set[str] | None = None,
+    ) -> list[LiveStreamCandidate]:
         """
         Return candidate CDN URLs (flv or m3u8) for the streaming.
         If the API returns status code 4003110 and a username is provided,
         falls back to scraping the live page directly.
+
+        The recorder shares ``stale_urls`` across refreshes so original-quality
+        URLs that return HTTP 404 are skipped for the rest of the recording round.
         """
-        data = self.http_client.get(
-            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
-        ).json()
+        return self._get_live_stream_candidates(
+            room_id, user, deadline=deadline, stale_urls=stale_urls
+        )
+
+    def _get_live_stream_candidates(
+        self,
+        room_id: str,
+        user: str | None,
+        *,
+        deadline: float | None = None,
+        stale_urls: set[str] | None = None,
+    ) -> list[LiveStreamCandidate]:
+        if stale_urls is None:
+            stale_urls = set()
+
+        timeout = self.MAX_SELECTION_HTTP_TIMEOUT_SECONDS
+        if deadline is not None:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                logger.warning(
+                    "Original selection budget exhausted before candidate API request."
+                )
+                return []
+            timeout = min(timeout, self.MAX_SELECTION_HTTP_TIMEOUT_SECONDS)
+
+        response = self._get_selection_response(
+            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}",
+            timeout,
+        )
+        response_body = self._read_response_body(response, deadline=deadline)
+        if response_body is None:
+            logger.warning(
+                "Original selection budget exhausted while reading the candidate "
+                "API response."
+            )
+            return []
+
+        if deadline is not None and time.monotonic() >= deadline:
+            logger.warning(
+                "Original selection budget exhausted before parsing the candidate "
+                "API response."
+            )
+            return []
+
+        data = json.loads(response_body)
 
         if "This account is private" in data:
             raise UserLiveError(TikTokError.ACCOUNT_PRIVATE)
@@ -541,9 +563,11 @@ class TikTokAPI:
                 logger.info(
                     "API blocked by WAF (4003110). Trying fallback: extract stream URL from live page..."
                 )
-                fallback_url = self._get_stream_url_from_page(user)
+                fallback_url = self._get_stream_url_from_page(
+                    user, deadline=deadline
+                )
                 if fallback_url:
-                    return [fallback_url]
+                    return [LiveStreamCandidate(fallback_url)]
 
             raise UserLiveError(TikTokError.LIVE_RESTRICTION)
 
@@ -552,7 +576,9 @@ class TikTokAPI:
         if room_status is not None and str(room_status) != "2":
             raise UserLiveError(TikTokError.USER_NOT_CURRENTLY_LIVE)
 
-        stream_url = room_data.get("stream_url", {})
+        stream_url = room_data.get("stream_url") or {}
+        if not isinstance(stream_url, dict):
+            return []
 
         sdk_data_str = (
             stream_url.get("live_core_sdk_data", {})
@@ -569,7 +595,7 @@ class TikTokAPI:
                 self._add_live_url_candidate(candidates, flv_pull_url.get(key))
             self._add_live_url_candidate(candidates, stream_url.get("hls_pull_url"))
             self._add_live_url_candidate(candidates, stream_url.get("rtmp_pull_url"))
-            return candidates
+            return [LiveStreamCandidate(url) for url in candidates]
 
         # Extract stream options
         sdk_data = json.loads(sdk_data_str).get("data", {})
@@ -581,11 +607,13 @@ class TikTokAPI:
         )
         if not qualities:
             logger.warning("No qualities found in the stream data. Returning None.")
-            return candidates
+            return []
         level_map = {q["sdk_key"]: q["level"] for q in qualities}
 
         # Local feature: probe the hidden original-quality stream first.
-        original_url = self._probe_original_quality_url(sdk_data)
+        original_url = self._derive_original_quality_url(
+            sdk_data, stale_urls=stale_urls
+        )
         if original_url:
             self._add_live_url_candidate(candidates, original_url)
 
@@ -595,7 +623,9 @@ class TikTokAPI:
         for sdk_key in ordered_sdk_keys:
             entry = sdk_data[sdk_key]
             stream_main = entry.get("main", {})
-            self._add_live_url_candidate(candidates, stream_main.get("flv"))
+            flv_url = stream_main.get("flv")
+            if not (flv_url and "only_audio=1" in flv_url):
+                self._add_live_url_candidate(candidates, flv_url)
             self._add_live_url_candidate(
                 candidates, stream_main.get("hls") or stream_main.get("m3u8")
             )
@@ -606,18 +636,53 @@ class TikTokAPI:
         self._add_live_url_candidate(candidates, stream_url.get("hls_pull_url"))
         self._add_live_url_candidate(candidates, stream_url.get("rtmp_pull_url"))
 
-        return candidates
+        resolved_candidates = [
+            LiveStreamCandidate(
+                url=url,
+                is_original_quality=bool(original_url and url == original_url),
+            )
+            for url in candidates
+        ]
 
-    def get_live_url(self, room_id: str, user: str = None) -> str | None:
+        return resolved_candidates
+
+    def get_live_urls(
+        self,
+        room_id: str,
+        user: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> list[str]:
+        """Return candidate URLs while preserving the legacy string-list API."""
+        return [
+            candidate.url
+            for candidate in self.get_live_stream_candidates(
+                room_id, user=user, deadline=deadline
+            )
+        ]
+
+    def get_live_url(
+        self,
+        room_id: str,
+        user: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> str | None:
         """Return the first candidate CDN URL for the streaming."""
-        live_urls = self.get_live_urls(room_id, user=user)
+        live_urls = self.get_live_urls(room_id, user=user, deadline=deadline)
         if live_urls:
             return live_urls[0]
         return None
 
-    def get_live_url_candidates(self, room_id: str, user: str = None) -> list[str]:
+    def get_live_url_candidates(
+        self,
+        room_id: str,
+        user: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> list[str]:
         """Return candidate CDN URLs for the streaming."""
-        return self.get_live_urls(room_id, user=user)
+        return self.get_live_urls(room_id, user=user, deadline=deadline)
 
     def download_live_stream(self, live_url: str):
         """Generator that returns the live stream for a given room_id."""
