@@ -1,5 +1,8 @@
 import logging
+import traceback
 from logging.handlers import RotatingFileHandler
+
+from utils.url_sanitizer import redact_urls_in_text
 
 
 class MaxLevelFilter(logging.Filter):
@@ -15,12 +18,26 @@ class MaxLevelFilter(logging.Filter):
         return record.levelno <= self.max_level
 
 
+class URLRedactionFilter(logging.Filter):
+    """Redact URL credentials from application messages and tracebacks."""
+
+    def filter(self, record):
+        record.msg = redact_urls_in_text(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = redact_urls_in_text(
+                "".join(traceback.format_exception(*record.exc_info))
+            )
+            record.exc_info = None
+        return True
+
+
 class LoggerManager:
     _instance = None
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(LoggerManager, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
             cls._instance.logger = None
             cls._instance.setup_logger()
         return cls._instance
@@ -29,6 +46,7 @@ class LoggerManager:
         if self.logger is None:
             self.logger = logging.getLogger("logger")
             self.logger.setLevel(logging.DEBUG)
+            self.logger.addFilter(URLRedactionFilter())
 
             fmt_datefmt = "%Y-%m-%d %H:%M:%S"
 
@@ -50,11 +68,11 @@ class LoggerManager:
             self.logger.addHandler(error_handler)
 
             # 3) File handler — DEBUG level, includes full stack traces
-            #    Rotates at 5 MB, keeps 3 backups
+            #    Rotates at 20 MB, keeps 10 backups
             file_handler = RotatingFileHandler(
                 "tiktok-recorder.log",
-                maxBytes=5 * 1024 * 1024,
-                backupCount=3,
+                maxBytes=20 * 1024 * 1024,
+                backupCount=10,
                 encoding="utf-8",
             )
             file_handler.setLevel(logging.DEBUG)
